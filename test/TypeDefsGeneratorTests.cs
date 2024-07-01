@@ -11,7 +11,7 @@ using Xunit;
 
 namespace Microsoft.JavaScript.NodeApi.Test;
 
-#if !NETFRAMEWORK
+#if !(NETFRAMEWORK || NETSTANDARD)
 #pragma warning disable CA1822 // Mark members as static
 
 public class TypeDefsGeneratorTests
@@ -27,16 +27,20 @@ public class TypeDefsGeneratorTests
     private static TypeDefinitionsGenerator CreateTypeDefinitionsGenerator(
         IEnumerable<KeyValuePair<string, XElement>> docs, bool insertNamespace = true)
     {
-        string ns = typeof(TypeDefsGeneratorTests).FullName + "+";
+        string ns = typeof(TypeDefsGeneratorTests).Namespace + ".";
         XDocument docsXml = new(new XElement("root", new XElement("members",
             docs.Select((pair) => new XElement("member",
                 new XAttribute("name", insertNamespace ? pair.Key.Insert(2, ns) : pair.Key),
                 pair.Value)))));
-        return new TypeDefinitionsGenerator(
+        TypeDefinitionsGenerator generator = new(
             typeof(TypeDefsGeneratorTests).Assembly,
-            assemblyDoc: docsXml,
-            referenceAssemblies: new Dictionary<string, Assembly>(),
-            suppressWarnings: true);
+            referenceAssemblies: new Dictionary<string, Assembly>())
+        {
+            ExportAll = true,
+            SuppressWarnings = true,
+        };
+        generator.LoadAssemblyDoc(typeof(TypeDefsGeneratorTests).Assembly.GetName().Name!, docsXml);
+        return generator;
     }
 
     private string GenerateTypeDefinition(
@@ -54,12 +58,6 @@ public class TypeDefsGeneratorTests
 
     private string GenerateMemberDefinition(MemberInfo member, IDictionary<string, XElement> docs)
         => CreateTypeDefinitionsGenerator(docs).GenerateMemberDefinition(member).TrimEnd();
-
-    private interface SimpleInterface
-    {
-        string TestProperty { get; set; }
-        string TestMethod();
-    }
 
     [Fact]
     public void GenerateSimpleInterface()
@@ -84,19 +82,13 @@ public class TypeDefsGeneratorTests
         }));
     }
 
-    internal class SimpleClass : SimpleInterface
-    {
-        public string TestProperty { get; set; } = null!;
-        public string TestMethod() { return string.Empty; }
-    }
-
     [Fact]
     public void GenerateSimpleClass()
     {
         Assert.Equal("""
 
             /** class */
-            export class SimpleClass {
+            export class SimpleClass implements SimpleInterface {
             	/** constructor */
             	constructor();
 
@@ -134,8 +126,6 @@ public class TypeDefsGeneratorTests
                 new Dictionary<string, string>()));
     }
 
-    private delegate void SimpleDelegate(string arg);
-
     [Fact]
     public void GenerateSimpleDelegate()
     {
@@ -148,12 +138,6 @@ public class TypeDefsGeneratorTests
         {
             ["T:SimpleDelegate"] = "delegate",
         }));
-    }
-
-    private enum TestEnum
-    {
-        Zero = 0,
-        One = 1,
     }
 
     [Fact]
@@ -176,12 +160,6 @@ public class TypeDefsGeneratorTests
             ["F:TestEnum.Zero"] = "zero",
             ["F:TestEnum.One"] = "one",
         }));
-    }
-
-    private interface GenericInterface<T>
-    {
-        T TestProperty { get; set; }
-        T TestMethod(T value);
     }
 
     [Fact]
@@ -209,15 +187,6 @@ public class TypeDefsGeneratorTests
         }));
     }
 
-    private class GenericClass<T> : GenericInterface<T>
-    {
-        public GenericClass(T value) { TestProperty = value; }
-        public T TestProperty { get; set; } = default!;
-        public T TestMethod(T value) { return value; }
-        public static T TestStaticProperty { get; set; } = default!;
-        public static T TestStaticMethod(T value) { return value; }
-    }
-
     [Fact]
     public void GenerateGenericClass()
     {
@@ -227,7 +196,7 @@ public class TypeDefsGeneratorTests
             export function GenericClass$(T: IType): typeof GenericClass$1<any>;
 
             /** generic-class */
-            export class GenericClass$1<T> {
+            export class GenericClass$1<T> implements GenericInterface$1<T> {
             	/** constructor */
             	new(value: T): GenericClass$1<T>;
 
@@ -254,8 +223,6 @@ public class TypeDefsGeneratorTests
             ["M:GenericClass`1.TestMethod(`0)"] = "instance-method",
         }));
     }
-
-    private delegate T GenericDelegate<T>(T arg);
 
     [Fact]
     public void GenerateGenericDelegate()
@@ -303,10 +270,10 @@ public class TypeDefsGeneratorTests
 
             export namespace SimpleClassExtensions {
             	/** extension A */
-            	export function TestExtensionA(value: unknown): void;
+            	export function TestExtensionA(value: SimpleClass): void;
 
             	/** extension B */
-            	export function TestExtensionB(value: unknown): void;
+            	export function TestExtensionB(value: SimpleClass): void;
             }
 
             /** Extension methods from {@link Microsoft.JavaScript.NodeApi.Test.SimpleClassExtensions} */
@@ -326,13 +293,50 @@ public class TypeDefsGeneratorTests
     }
 }
 
-internal static class SimpleClassExtensions
+public interface SimpleInterface
 {
-    public static void TestExtensionA(this TypeDefsGeneratorTests.SimpleClass value)
-        => value.TestMethod();
-    public static void TestExtensionB(this TypeDefsGeneratorTests.SimpleClass value)
-        => value.TestMethod();
+    string TestProperty { get; set; }
+    string TestMethod();
+}
+
+public class SimpleClass : SimpleInterface
+{
+    public string TestProperty { get; set; } = null!;
+    public string TestMethod() { return string.Empty; }
+}
+
+public delegate void SimpleDelegate(string arg);
+
+public enum TestEnum
+{
+    Zero = 0,
+    One = 1,
 }
 
 
-#endif // !NETFRAMEWORK
+public interface GenericInterface<T>
+{
+    T TestProperty { get; set; }
+    T TestMethod(T value);
+}
+
+public class GenericClass<T> : GenericInterface<T>
+{
+    public GenericClass(T value) { TestProperty = value; }
+    public T TestProperty { get; set; } = default!;
+    public T TestMethod(T value) { return value; }
+    public static T TestStaticProperty { get; set; } = default!;
+    public static T TestStaticMethod(T value) { return value; }
+}
+
+public delegate T GenericDelegate<T>(T arg);
+
+public static class SimpleClassExtensions
+{
+    public static void TestExtensionA(this SimpleClass value)
+        => value.TestMethod();
+    public static void TestExtensionB(this SimpleClass value)
+        => value.TestMethod();
+}
+
+#endif

@@ -44,17 +44,21 @@ public abstract class SourceGenerator
         UnsupportedIndexer,
         ReferenedTypeNotExported,
         ESModulePropertiesAreConst,
+        DocLoadError,
     }
 
     public static string GetNamespace(ISymbol symbol)
     {
         string ns = string.Empty;
+
+        // ContainingNamespace may be null for constructed types like arrays.
         for (INamespaceSymbol s = symbol.ContainingNamespace;
-            !s.IsGlobalNamespace;
+            s?.IsGlobalNamespace == false;
             s = s.ContainingNamespace)
         {
             ns = s.Name + (ns.Length > 0 ? "." + ns : string.Empty);
         }
+
         return ns;
     }
 

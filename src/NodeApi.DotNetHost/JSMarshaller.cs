@@ -169,8 +169,10 @@ public class JSMarshaller
             type == typeof(ICollection<>) ||
             type == typeof(IReadOnlyCollection<>) ||
             type == typeof(ISet<>) ||
-#if !NETFRAMEWORK
+#if READONLY_SET
             type == typeof(IReadOnlySet<>) ||
+#else
+            // TODO: Support IReadOnlySet on .NET Framework / .NET Standard 2.0.
 #endif
             type == typeof(IList<>) ||
             type == typeof(IReadOnlyList<>) ||
@@ -2034,13 +2036,24 @@ public class JSMarshaller
             }
             else if (toType == typeof(TimeSpan))
             {
-                MethodInfo asString = typeof(JSValue).GetExplicitConversion(
-                    typeof(JSValue), typeof(string));
+                MethodInfo asDouble = typeof(JSValue).GetExplicitConversion(
+                    typeof(JSValue), typeof(double));
                 MethodInfo toTimeSpan = typeof(TimeSpan).GetStaticMethod(
-                    nameof(TimeSpan.Parse), new[] { typeof(string) });
+                    nameof(TimeSpan.FromMilliseconds));
                 statements = new[]
                 {
-                    Expression.Call(toTimeSpan, Expression.Call(asString, valueParameter)),
+                    Expression.Call(toTimeSpan, Expression.Call(asDouble, valueParameter)),
+                };
+            }
+            else if (toType == typeof(DateTimeOffset))
+            {
+                MethodInfo asJSDate = typeof(JSDate).GetExplicitConversion(
+                    typeof(JSValue), typeof(JSDate));
+                MethodInfo toDateTimeOffset = typeof(JSDate).GetInstanceMethod(
+                    nameof(JSDate.ToDateTimeOffset));
+                statements = new[]
+                {
+                    Expression.Call(Expression.Call(asJSDate, valueParameter), toDateTimeOffset),
                 };
             }
             else if (toType == typeof(Guid))
@@ -2341,13 +2354,24 @@ public class JSMarshaller
             }
             else if (fromType == typeof(TimeSpan))
             {
-                MethodInfo toString = typeof(TimeSpan).GetInstanceMethod(
-                    nameof(TimeSpan.ToString), []);
+                PropertyInfo doubleValue = typeof(TimeSpan).GetInstanceProperty(
+                    nameof(TimeSpan.TotalMilliseconds));
                 MethodInfo asJSValue = typeof(JSValue).GetImplicitConversion(
-                    typeof(string), typeof(JSValue));
+                    typeof(double), typeof(JSValue));
                 statements = new[]
                 {
-                    Expression.Call(asJSValue, Expression.Call(valueParameter, toString)),
+                    Expression.Call(asJSValue, Expression.Property(valueParameter, doubleValue)),
+                };
+            }
+            else if (fromType == typeof(DateTimeOffset))
+            {
+                MethodInfo fromDateTimeOffset = typeof(JSDate).GetStaticMethod(
+                    nameof(JSDate.FromDateTimeOffset));
+                MethodInfo asJSValue = typeof(JSDate).GetImplicitConversion(
+                    typeof(JSDate), typeof(JSValue));
+                statements = new[]
+                {
+                    Expression.Call(asJSValue, Expression.Call(fromDateTimeOffset, valueParameter)),
                 };
             }
             else if (fromType == typeof(Guid))
@@ -2771,8 +2795,10 @@ public class JSMarshaller
 
         if (typeDefinition == typeof(IList<>) ||
             typeDefinition == typeof(ICollection<>) ||
-#if !NETFRAMEWORK
+#if READONLY_SET
             typeDefinition == typeof(IReadOnlySet<>) ||
+#else
+            // TODO: Support IReadOnlySet on .NET Framework / .NET Standard 2.0.
 #endif
             typeDefinition == typeof(ISet<>))
         {
@@ -2785,7 +2811,7 @@ public class JSMarshaller
             Type jsCollectionType = typeDefinition.Name.Contains("Set") ?
                 typeof(JSSet) : typeof(JSArray);
             MethodInfo asCollectionMethod = typeof(JSCollectionExtensions).GetStaticMethod(
-#if NETFRAMEWORK
+#if !STRING_AS_SPAN
                 "As" + typeDefinition.Name.Substring(1, typeDefinition.Name.IndexOf('`') - 1),
 #else
                 string.Concat("As",
@@ -2816,7 +2842,7 @@ public class JSMarshaller
                 typeof(JSIterable) : typeDefinition == typeof(IAsyncEnumerable<>) ?
                 typeof(JSAsyncIterable) : typeof(JSArray);
             MethodInfo asCollectionMethod = typeof(JSCollectionExtensions).GetStaticMethod(
-#if NETFRAMEWORK
+#if !STRING_AS_SPAN
                 "As" + typeDefinition.Name.Substring(1, typeDefinition.Name.IndexOf('`') - 1),
 #else
                 string.Concat("As",
@@ -2905,8 +2931,10 @@ public class JSMarshaller
 
         if (typeDefinition == typeof(IList<>) ||
             typeDefinition == typeof(ICollection<>) ||
-#if !NETFRAMEWORK
+#if READONLY_SET
             typeDefinition == typeof(IReadOnlySet<>) ||
+#else
+    // TODO: Support IReadOnlySet on .NET Framework / .NET Standard 2.0.
 #endif
             typeDefinition == typeof(ISet<>))
         {
@@ -3110,7 +3138,7 @@ public class JSMarshaller
             if (nameEnd >= 0)
             {
                 string typeArgs = string.Join("_", type.GenericTypeArguments.Select(FullTypeName));
-#if NETFRAMEWORK
+#if !STRING_AS_SPAN
                 name = name.Substring(0, nameEnd) + "_of_" + typeArgs;
 #else
                 name = string.Concat(name.AsSpan(0, nameEnd), "_of_", typeArgs);
@@ -3290,7 +3318,7 @@ public class JSMarshaller
     {
         string assemblyName = forType.FullName + "_" + Environment.CurrentManagedThreadId;
 
-#if NETFRAMEWORK
+#if NETFRAMEWORK || NETSTANDARD
         bool collectible = false;
 #else
         // Make the dynamic assembly collectible if in a collectible load context.

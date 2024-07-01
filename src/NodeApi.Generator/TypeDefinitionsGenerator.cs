@@ -186,14 +186,21 @@ dotnet.load(assemblyName);";
     private readonly Assembly _assembly;
     private readonly IDictionary<string, Assembly> _referenceAssemblies;
     private readonly HashSet<string> _imports;
-    private readonly XDocument? _assemblyDoc;
+    private readonly Dictionary<string, XDocument> _assemblyDocs = new();
     private readonly List<MemberInfo> _exportedMembers = new();
     private bool _isModule;
     private bool _autoCamelCase;
     private bool _emitDisposable;
     private bool _emitDuplex;
     private bool _emitType;
-    private readonly bool _suppressWarnings;
+    private bool _emitDateTime;
+    private bool _emitDateTimeOffset;
+
+    /// <summary>
+    /// When generating type definitions for a system assembly, some supplemental type definitions
+    /// need an extra namespace qualifier to prevent conflicts with types in the "System" namespace.
+    /// </summary>
+    private readonly bool _isSystemAssembly;
 
     public static void GenerateTypeDefinitions(
         string assemblyPath,
@@ -226,14 +233,21 @@ dotnet.load(assemblyName);";
         }
 
         // Create a metadata load context that includes a resolver for system assemblies,
-        // referenced assemblies, referenced assemblies, and the target assembly.
+        // referenced assemblies, and the target assembly.
         IEnumerable<string> allReferenceAssemblyPaths = MergeSystemReferenceAssemblies(
             referenceAssemblyPaths, systemReferenceAssemblyDirectories);
-        PathAssemblyResolver assemblyResolver = new(
-            allReferenceAssemblyPaths.Append(assemblyPath));
+        bool isCoreAssembly = Path.GetFileNameWithoutExtension(assemblyPath).Equals(
+            typeof(object).Assembly.GetName().Name, StringComparison.OrdinalIgnoreCase);
+        if (!isCoreAssembly)
+        {
+            allReferenceAssemblyPaths = allReferenceAssemblyPaths.Append(assemblyPath);
+        }
+
+        PathAssemblyResolver assemblyResolver = new(allReferenceAssemblyPaths);
         using MetadataLoadContext loadContext = new(assemblyResolver);
 
-        Assembly assembly = loadContext.LoadFromAssemblyPath(assemblyPath);
+        Assembly assembly = isCoreAssembly ? loadContext.CoreAssembly! :
+            loadContext.LoadFromAssemblyPath(assemblyPath);
 
         Dictionary<string, Assembly> referenceAssemblies = new();
         foreach (string referenceAssemblyPath in referenceAssemblyPaths)
@@ -249,33 +263,19 @@ dotnet.load(assemblyName);";
             referenceAssemblies.Add(referenceAssemblyName, referenceAssembly);
         }
 
-        XDocument? assemblyDoc = null;
-        string? assemblyDocFilePath = Path.ChangeExtension(assemblyPath, ".xml");
-        if (!File.Exists(assemblyDocFilePath))
-        {
-            // Some doc XML files are missing the first-level namespace prefix.
-            string assemblyFileName = Path.GetFileNameWithoutExtension(assemblyPath);
-            assemblyDocFilePath = Path.Combine(
-                Path.GetDirectoryName(assemblyPath)!,
-#if NETFRAMEWORK
-                assemblyFileName.Substring(assemblyFileName.IndexOf('.') + 1) + ".xml");
-#else
-                string.Concat(assemblyFileName.AsSpan(assemblyFileName.IndexOf('.') + 1), ".xml"));
-#endif
-        }
-
-        if (File.Exists(assemblyDocFilePath))
-        {
-            assemblyDoc = XDocument.Load(assemblyDocFilePath);
-        }
+        CustomAttributeData? assemblyExportAttribute = assembly.GetCustomAttributesData()
+            .FirstOrDefault((a) => a.AttributeType.FullName == typeof(JSExportAttribute).FullName);
 
         try
         {
-            TypeDefinitionsGenerator generator = new(
-                assembly,
-                assemblyDoc,
-                referenceAssemblies,
-                suppressWarnings);
+            TypeDefinitionsGenerator generator = new(assembly, referenceAssemblies)
+            {
+                SuppressWarnings = suppressWarnings,
+                ExportAll = assemblyExportAttribute != null &&
+                    GetExportAttributeValue(assemblyExportAttribute),
+            };
+
+            generator.LoadAssemblyDocs();
             SourceText generatedSource = generator.GenerateTypeDefinitions();
             File.WriteAllText(typeDefinitionsPath, generatedSource.ToString());
 
@@ -350,9 +350,7 @@ dotnet.load(assemblyName);";
 
     public TypeDefinitionsGenerator(
         Assembly assembly,
-        XDocument? assemblyDoc,
-        IDictionary<string, Assembly> referenceAssemblies,
-        bool suppressWarnings)
+        IDictionary<string, Assembly> referenceAssemblies)
     {
         if (assembly is null)
         {
@@ -364,15 +362,18 @@ dotnet.load(assemblyName);";
         }
 
         _assembly = assembly;
-        _assemblyDoc = assemblyDoc;
         _referenceAssemblies = referenceAssemblies;
         _imports = new HashSet<string>();
-        _suppressWarnings = suppressWarnings;
+        _isSystemAssembly = assembly.GetName().Name!.StartsWith("System.");
     }
+
+    public bool ExportAll { get; set; }
+
+    public bool SuppressWarnings { get; set; }
 
     public override void ReportDiagnostic(Diagnostic diagnostic)
     {
-        if (_suppressWarnings && diagnostic.Severity == DiagnosticSeverity.Warning)
+        if (SuppressWarnings && diagnostic.Severity == DiagnosticSeverity.Warning)
         {
             return;
         }
@@ -406,6 +407,10 @@ dotnet.load(assemblyName);";
         int importsIndex = s.Length;
 
         _exportedMembers.AddRange(GetExportedMembers());
+        if (!_isModule)
+        {
+            ExportAll = true;
+        }
 
         // Default to camel-case for modules, preserve case otherwise.
         _autoCamelCase = autoCamelCase ?? _isModule;
@@ -422,14 +427,14 @@ dotnet.load(assemblyName);";
 
         foreach (Type type in _assembly.GetTypes().Where((t) => t.IsPublic))
         {
-            if (!_isModule || IsExported(type))
+            if (IsExported(type))
             {
                 ExportType(ref s, type);
             }
             else
             {
                 foreach (MemberInfo member in type.GetMembers(
-                    BindingFlags.Public | BindingFlags.Static))
+                    BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly))
                 {
                     if (IsExported(member))
                     {
@@ -542,7 +547,7 @@ dotnet.load(assemblyName);";
     {
         Type type = member as Type ?? member.DeclaringType!;
 
-        if (IsExcludedNamespace(type.Namespace))
+        if (IsExcluded(type))
         {
             return false;
         }
@@ -557,27 +562,34 @@ dotnet.load(assemblyName);";
         }
 
         CustomAttributeData? exportAttribute = GetAttribute<JSExportAttribute>(member);
+        if (exportAttribute == null && !IsPublic(member))
+        {
+            return false;
+        }
 
-        // If the member doesn't have a [JSExport] attribute, check its declaring type
-        // and declaring assembly.
-        while (exportAttribute == null && member.DeclaringType != null &&
-            (member.DeclaringType.IsPublic || member.DeclaringType.IsNestedPublic))
+        // If the member doesn't have a [JSExport] attribute, check its declaring type.
+        while (exportAttribute == null && member.DeclaringType != null)
         {
             member = member.DeclaringType;
             exportAttribute = GetAttribute<JSExportAttribute>(member);
-        }
-
-        if (exportAttribute == null)
-        {
-            exportAttribute = type.Assembly.GetCustomAttributesData().FirstOrDefault((a) =>
-                a.AttributeType.FullName == typeof(JSExportAttribute).FullName);
-
-            if (exportAttribute == null)
+            if (exportAttribute == null && !IsPublic(member))
             {
                 return false;
             }
         }
 
+        // Return export attribute value if found, or else the default for the assembly.
+        return exportAttribute != null ? GetExportAttributeValue(exportAttribute) : ExportAll;
+    }
+
+    private static CustomAttributeData? GetAttribute<T>(MemberInfo member)
+    {
+        return member.GetCustomAttributesData().FirstOrDefault((a) =>
+            a.AttributeType.FullName == typeof(T).FullName);
+    }
+
+    private static bool GetExportAttributeValue(CustomAttributeData exportAttribute)
+    {
         // If the [JSExport] attribute has a single boolean constructor argument, use that.
         // Any other constructor defaults to true.
         CustomAttributeTypedArgument constructorArgument =
@@ -585,10 +597,26 @@ dotnet.load(assemblyName);";
         return constructorArgument.Value as bool? ?? true;
     }
 
-    private static CustomAttributeData? GetAttribute<T>(MemberInfo member)
+    private static bool IsPublic(MemberInfo member)
     {
-        return member.GetCustomAttributesData().FirstOrDefault((a) =>
-            a.AttributeType.FullName == typeof(T).FullName);
+        if (member is not Type &&
+            member.DeclaringType is Type declaringType && declaringType.IsInterface)
+        {
+            // Interface members are always public even if not declared.
+            return true;
+        }
+
+        return member switch
+        {
+            Type type => type.IsPublic || type.IsNestedPublic,
+            MethodBase method => method.IsPublic,
+            PropertyInfo property => (property.GetMethod?.IsPublic ?? false) ||
+                (property.SetMethod?.IsPublic ?? false),
+            EventInfo @event => (@event.AddMethod?.IsPublic ?? false) ||
+                (@event.RemoveMethod?.IsPublic ?? false),
+            FieldInfo field => field.IsPublic,
+            _ => false,
+        };
     }
 
     private IEnumerable<MemberInfo> GetExportedMembers()
@@ -704,9 +732,7 @@ interface IType {
         if (_emitDisposable)
         {
             s.Insert(insertIndex, @"
-interface IDisposable {
-	dispose(): void;
-}
+interface IDisposable { dispose(): void; }
 ");
         }
 
@@ -716,7 +742,26 @@ interface IDisposable {
 import { Duplex } from 'stream';
 ");
         }
+
+        if (_emitDateTimeOffset)
+        {
+            s.Insert(insertIndex, _isSystemAssembly ? @"
+declare namespace js { type DateTimeOffset = Date | { offset?: number } }
+" : @"
+type DateTimeOffset = Date | { offset?: number }
+");
+        }
+
+        if (_emitDateTime)
+        {
+            s.Insert(insertIndex, _isSystemAssembly ? @"
+declare namespace js { type DateTime = Date | { kind?: 'utc' | 'local' | 'unspecified' } }
+" : @"
+type DateTime = Date | { kind?: 'utc' | 'local' | 'unspecified' }
+");
+        }
     }
+
     private static string GetGenericParams(Type type)
     {
         string genericParams = string.Empty;
@@ -782,17 +827,13 @@ import { Duplex } from 'stream';
         string implementsKind = type.IsInterface ? "extends" : "implements";
 
         string implements = string.Empty;
-        Type[] interfaceTypes = type.GetInterfaces();
+        Type[] interfaceTypes = type.GetInterfaces().Where(IsExported).ToArray();
         foreach (Type interfaceType in interfaceTypes)
         {
             string prefix = (implements.Length == 0 ? $" {implementsKind}" : ",") +
                 (interfaceTypes.Length > 1 ? "\n\t" : " ");
 
-            if (!interfaceType.IsPublic || IsExcludedNamespace(interfaceType.Namespace))
-            {
-                continue;
-            }
-            else if (isStreamSubclass &&
+            if (isStreamSubclass &&
                 (interfaceType.Name == nameof(IDisposable) ||
                 interfaceType.Name == nameof(IAsyncDisposable)))
             {
@@ -840,9 +881,9 @@ import { Duplex } from 'stream';
 
         bool isFirstMember = true;
         foreach (ConstructorInfo constructor in type.GetConstructors(
-            BindingFlags.Public | BindingFlags.Instance))
+            BindingFlags.Public | BindingFlags.Instance).Where(IsExported))
         {
-            if (!IsExcludedMember(constructor))
+            if (!IsExcluded(constructor))
             {
                 if (isFirstMember) isFirstMember = false; else s++;
                 ExportTypeMember(ref s, constructor);
@@ -854,10 +895,10 @@ import { Duplex } from 'stream';
             foreach (PropertyInfo property in type.GetProperties(
                 BindingFlags.Public | BindingFlags.Instance |
                 (isStaticClass ? BindingFlags.DeclaredOnly : default) |
-                (type.IsInterface ? default : BindingFlags.Static)))
+                (type.IsInterface ? default : BindingFlags.Static)).Where(IsExported))
             {
                 // Indexed properties are not implemented.
-                if (!IsExcludedMember(property) && property.GetIndexParameters().Length == 0)
+                if (!IsExcluded(property) && property.GetIndexParameters().Length == 0)
                 {
                     if (isFirstMember) isFirstMember = false; else s++;
                     ExportTypeMember(ref s, property);
@@ -867,9 +908,9 @@ import { Duplex } from 'stream';
             foreach (MethodInfo method in type.GetMethods(
                 BindingFlags.Public | BindingFlags.Instance |
                 (isStaticClass ? BindingFlags.DeclaredOnly : default) |
-                (type.IsInterface ? default : BindingFlags.Static)))
+                (type.IsInterface ? default : BindingFlags.Static)).Where(IsExported))
             {
-                if (!IsExcludedMember(method))
+                if (!IsExcluded(method))
                 {
                     if (isFirstMember) isFirstMember = false; else s++;
                     ExportTypeMember(ref s, method);
@@ -885,7 +926,7 @@ import { Duplex } from 'stream';
 
         EndNamespace(ref s, type);
 
-        foreach (Type nestedType in type.GetNestedTypes(BindingFlags.Public))
+        foreach (Type nestedType in type.GetNestedTypes(BindingFlags.Public).Where(IsExported))
         {
             ExportType(ref s, nestedType);
         }
@@ -933,7 +974,7 @@ import { Duplex } from 'stream';
         int genericMarkerIndex = methodNamePrefix.IndexOf('`');
         if (genericMarkerIndex >= 0)
         {
-#if NETFRAMEWORK
+#if !STRING_AS_SPAN
             methodNamePrefix = methodNamePrefix.Substring(0, genericMarkerIndex) + '<';
 #else
             methodNamePrefix = string.Concat(methodNamePrefix.AsSpan(0, genericMarkerIndex), "<");
@@ -995,7 +1036,7 @@ import { Duplex } from 'stream';
 
         IEnumerable<IGrouping<Type, MethodInfo>> extensionMethodsByTargetType =
             type.GetMethods(BindingFlags.Static | BindingFlags.Public)
-            .Where((m) => IsExtensionMember(m) && !IsExcludedMember(m))
+            .Where((m) => IsExtensionMember(m) && IsExported(m) && !IsExcluded(m))
             .GroupBy((m) => m.GetParameters()[0].ParameterType)
             .Where((g) => IsExtensionTargetTypeSupported(g.Key));
         foreach (IGrouping<Type, MethodInfo> extensionMethodGroup in extensionMethodsByTargetType)
@@ -1040,8 +1081,7 @@ import { Duplex } from 'stream';
 
     private static bool IsExtensionMember(MemberInfo member)
     {
-        return member.GetCustomAttributesData().Any(
-            (a) => a.AttributeType.FullName == typeof(ExtensionAttribute).FullName);
+        return GetAttribute<ExtensionAttribute>(member) != null;
     }
 
     private static bool IsExtensionTargetTypeSupported(Type targetType)
@@ -1192,12 +1232,32 @@ import { Duplex } from 'stream';
         }
     }
 
-    private static bool IsExcludedNamespace(string? ns)
+    private static bool IsExcluded(MemberInfo member)
     {
+        if (member is PropertyInfo property)
+        {
+            return IsExcluded(property);
+        }
+        else if (member is MethodBase method)
+        {
+            return IsExcluded(method);
+        }
+
+        Type type = member as Type ?? member.DeclaringType!;
+
+        // While most types in InteropServices are excluded, safe handle classes are useful
+        // to include because they are extended by handle classes in other assemblies.
+        if (type.FullName == typeof(System.Runtime.InteropServices.SafeHandle).FullName ||
+            type.FullName == typeof(System.Runtime.InteropServices.CriticalHandle).FullName)
+        {
+            return false;
+        }
+
         // These namespaces contain APIs that are problematic for TS generation.
         // (Mostly old .NET Framework APIs.)
-        return ns switch
+        return type.Namespace switch
         {
+            "System.Runtime.CompilerServices" or
             "System.Runtime.InteropServices" or
             "System.Runtime.Remoting.Messaging" or
             "System.Runtime.Serialization" or
@@ -1207,14 +1267,14 @@ import { Duplex } from 'stream';
         };
     }
 
-    private static bool IsExcludedMember(PropertyInfo property)
+    private static bool IsExcluded(PropertyInfo property)
     {
         if (property.PropertyType.IsPointer)
         {
             return true;
         }
 
-        if (IsExcludedNamespace(property.PropertyType.Namespace))
+        if (IsExcluded(property.PropertyType))
         {
             return true;
         }
@@ -1222,7 +1282,7 @@ import { Duplex } from 'stream';
         return false;
     }
 
-    private static bool IsExcludedMember(MethodBase method)
+    private static bool IsExcluded(MethodBase method)
     {
         // Exclude "special" methods like property get/set and event add/remove.
         if (method is MethodInfo && method.IsSpecialName)
@@ -1259,7 +1319,8 @@ import { Duplex } from 'stream';
             return true;
         }
 
-        if (method.GetParameters().Any((p) => IsExcludedNamespace(p.ParameterType.Namespace)))
+        if (method.GetParameters().Any((p) => IsExcluded(p.ParameterType)) ||
+            (method is MethodInfo methodWithReturn && IsExcluded(methodWithReturn.ReturnType)))
         {
             return true;
         }
@@ -1300,9 +1361,25 @@ import { Duplex } from 'stream';
             propertyType = propertyType.GetElementType()!;
         }
 
+        NullabilityInfo nullability = FixNullability(_nullabilityContext.Create(property));
+
+#if NETFRAMEWORK || NETSTANDARD
+        // IEnumerator.Current property is not attributed as nullable but should be.
+        if (property.Name == nameof(System.Collections.IEnumerator.Current) &&
+            property.DeclaringType.FullName == typeof(System.Collections.IEnumerator).FullName)
+        {
+            nullability = new NullabilityInfo(
+                nullability.Type,
+                NullabilityState.Nullable,
+                nullability.WriteState,
+                nullability.ElementType,
+                nullability.GenericTypeArguments);
+        }
+#endif
+
         string tsType = GetTSType(
             propertyType,
-            FixNullability(_nullabilityContext.Create(property)),
+            nullability,
             allowTypeParameters);
 
         if (tsType == "unknown" || tsType.Contains("unknown"))
@@ -1461,7 +1538,7 @@ import { Duplex } from 'stream';
             return tsType;
         }
 
-        string? specialType = type.FullName switch
+        string? primitiveType = type.FullName switch
         {
             "System.Void" => "void",
             "System.Boolean" => "boolean",
@@ -1476,18 +1553,26 @@ import { Duplex } from 'stream';
             "System.Single" => "number",
             "System.Double" => "number",
             "System.String" => "string",
-            "System.DateTime" => "Date",
-            "System.TimeSpan" => "string",
+            "System.TimeSpan" => "number",
             "System.Guid" => "string",
             "System.Numerics.BigInteger" => "bigint",
             _ => null,
         };
 
-        if (specialType != null)
+        if (primitiveType != null)
         {
-            tsType = specialType;
+            tsType = primitiveType;
         }
-#if !NETFRAMEWORK
+#if NETFRAMEWORK || NETSTANDARD
+        else if (type.IsGenericTypeParameter())
+        {
+            tsType = allowTypeParams ? type.Name : "any";
+        }
+        else if (type.IsGenericMethodParameter())
+        {
+            tsType = type.Name;
+        }
+#else
         else if (type.IsGenericTypeParameter)
         {
             tsType = allowTypeParams ? type.Name : "any";
@@ -1544,7 +1629,7 @@ import { Duplex } from 'stream';
                 string tsTypeArg = GetTSType(typeArg, typeArgsNullability?[0], allowTypeParams);
                 tsType = $"(value: {tsTypeArg}) => boolean";
             }
-            else if (!_isModule || IsExported(type))
+            else if (IsExported(type))
             {
                 // Types exported from a module are not namespaced.
                 string nsPrefix = !_isModule && type.Namespace != null ? type.Namespace + '.' : "";
@@ -1576,7 +1661,17 @@ import { Duplex } from 'stream';
             tsType = "Duplex";
             _emitDuplex = true;
         }
-        else if (!_isModule || IsExported(type))
+        else if (type.FullName == typeof(DateTime).FullName)
+        {
+            _emitDateTime = true;
+            tsType = (_isSystemAssembly ? "js." : "") + type.Name;
+        }
+        else if (type.FullName == typeof(DateTimeOffset).FullName)
+        {
+            _emitDateTimeOffset = true;
+            tsType = (_isSystemAssembly ? "js." : "") + type.Name;
+        }
+        else if (IsExported(type))
         {
             // Types exported from a module are not namespaced.
             string nsPrefix = !_isModule && type.Namespace != null ? type.Namespace + '.' : "";
@@ -1669,7 +1764,7 @@ import { Duplex } from 'stream';
                 string elementTsType = GetTSType(typeArgs[0], typeArgsNullability?[0], allowTypeParams);
                 return $"Set<{elementTsType}>";
             }
-#if !NETFRAMEWORK
+#if READONLY_SET
             else if (typeDefinitionName == typeof(IReadOnlySet<>).FullName)
             {
                 string elementTsType = GetTSType(typeArgs[0], typeArgsNullability?[0], allowTypeParams);
@@ -1736,7 +1831,7 @@ import { Duplex } from 'stream';
         }
 
         if (nullability?.ReadState == NullabilityState.Nullable &&
-#if !NETFRAMEWORK
+#if !(NETFRAMEWORK || NETSTANDARD)
             !type.IsGenericTypeParameter && !type.IsGenericMethodParameter &&
 #endif
             !tsType.EndsWith(UndefinedTypeSuffix))
@@ -1799,8 +1894,7 @@ import { Duplex } from 'stream';
 
     private string GetExportName(MemberInfo member)
     {
-        CustomAttributeData? attribute = member.GetCustomAttributesData().FirstOrDefault(
-            (a) => a.AttributeType.FullName == typeof(JSExportAttribute).FullName);
+        CustomAttributeData? attribute = GetAttribute<JSExportAttribute>(member);
         if (attribute != null && attribute.ConstructorArguments.Count > 0 &&
             !string.IsNullOrEmpty(attribute.ConstructorArguments[0].Value as string))
         {
@@ -1822,25 +1916,93 @@ import { Duplex } from 'stream';
         }
     }
 
+    /// <summary>
+    /// Loads the XML documentation files for the primary assembly and all reference assemblies.
+    /// (Ignores any missing documentation files.)
+    /// </summary>
+    public void LoadAssemblyDocs()
+    {
+        LoadAssemblyDoc(_assembly);
+        foreach (Assembly referenceAssembly in _referenceAssemblies.Values)
+        {
+            LoadAssemblyDoc(referenceAssembly);
+        }
+    }
+
+    public void LoadAssemblyDoc(Assembly assembly)
+    {
+        string? assemblyDocFilePath = Path.ChangeExtension(assembly.Location, ".xml");
+        if (!LoadAssemblyDoc(assembly.GetName().Name!, assemblyDocFilePath))
+        {
+            // Some doc XML files are missing the first-level namespace prefix.
+            string assemblyFileName = Path.GetFileNameWithoutExtension(assembly.Location);
+            assemblyDocFilePath = Path.Combine(
+                Path.GetDirectoryName(assembly.Location)!,
+#if !STRING_AS_SPAN
+                assemblyFileName.Substring(assemblyFileName.IndexOf('.') + 1) + ".xml");
+#else
+                string.Concat(assemblyFileName.AsSpan(assemblyFileName.IndexOf('.') + 1), ".xml"));
+#endif
+            LoadAssemblyDoc(assembly.GetName().Name!, assemblyDocFilePath);
+        }
+    }
+
+    public bool LoadAssemblyDoc(string assemblyName, string xmlDocFilePath)
+    {
+        XDocument doc;
+        try
+        {
+            doc = XDocument.Load(xmlDocFilePath);
+        }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
+        catch (Exception ex)
+        {
+            ReportWarning(
+                DiagnosticId.DocLoadError,
+                $"Failed to load assembly documentation XML file '{xmlDocFilePath}': {ex.Message}");
+            return false;
+        }
+
+        LoadAssemblyDoc(assemblyName, doc);
+        return true;
+    }
+
+    public void LoadAssemblyDoc(string assemblyName, XDocument doc)
+    {
+        _assemblyDocs[assemblyName] = doc;
+    }
+
     private void GenerateDocComments(
         ref SourceBuilder s,
         MemberInfo member,
         string? summaryPrefix = null)
     {
-        string memberDocName = member switch
+        if (!_assemblyDocs.TryGetValue(
+            member.Module.Assembly.GetName().Name!, out XDocument? assemblyDoc))
         {
-            Type type => $"T:{type.FullName}",
-            PropertyInfo property => $"P:{property.DeclaringType!.FullName}.{property.Name}",
-            MethodInfo method => $"M:{FormatDocMethodName(method)}" +
-                FormatDocMethodParameters(method),
-            ConstructorInfo constructor => $"M:{constructor.DeclaringType!.FullName}.#ctor" +
-                FormatDocMethodParameters(constructor),
-            FieldInfo field => $"F:{field.DeclaringType!.FullName}.{field.Name}",
-            _ => string.Empty,
-        };
+            return;
+        }
 
-        XElement? memberElement = _assemblyDoc?.Root?.Element("members")?.Elements("member")
+        string memberDocName = GetMemberDocName(member);
+        XElement? memberElement = assemblyDoc?.Root?.Element("members")?.Elements("member")
             .FirstOrDefault((m) => m.Attribute("name")?.Value == memberDocName);
+
+        // If the member doc is inherited, resolve the inherited member and use its assembly doc.
+        MemberInfo? inheritedMember = member;
+        while (memberElement?.Element("inheritdoc") != null && inheritedMember != null)
+        {
+            inheritedMember = GetInheritedMember(inheritedMember);
+            if (inheritedMember != null && _assemblyDocs.TryGetValue(
+                inheritedMember.Module.Assembly.GetName().Name!, out assemblyDoc))
+            {
+                string inheritedMemberDocName = GetMemberDocName(inheritedMember);
+                memberElement = assemblyDoc?.Root?.Element("members")?.Elements("member")
+                    .FirstOrDefault((m) => m.Attribute("name")?.Value == inheritedMemberDocName);
+            }
+        }
 
         XElement? summaryElement = memberElement?.Element("summary");
         XElement? remarksElement = memberElement?.Element("remarks");
@@ -1877,6 +2039,112 @@ import { Duplex } from 'stream';
 
             s += " */";
         }
+    }
+
+    private static string GetMemberDocName(MemberInfo member)
+    {
+        return member switch
+        {
+            Type type => $"T:{type.FullName}",
+            PropertyInfo property => $"P:{property.DeclaringType!.FullName}.{property.Name}",
+            MethodInfo method => $"M:{FormatDocMethodName(method)}" +
+                FormatDocMethodParameters(method),
+            ConstructorInfo constructor => $"M:{constructor.DeclaringType!.FullName}.#ctor" +
+                FormatDocMethodParameters(constructor),
+            FieldInfo field => $"F:{field.DeclaringType!.FullName}.{field.Name}",
+            _ => string.Empty,
+        };
+    }
+
+    /// <summary>
+    /// Gets the inherited declaration of a member from a base class or interface,
+    /// for the purpose of inheriting documentation comments.
+    /// </summary>
+    private static MemberInfo? GetInheritedMember(MemberInfo member)
+    {
+        if (member.DeclaringType == null)
+        {
+            return null;
+        }
+
+        BindingFlags bindingFlags = BindingFlags.Instance | BindingFlags.DeclaredOnly |
+            BindingFlags.Public | BindingFlags.NonPublic;
+
+        if (member is PropertyInfo property)
+        {
+            Type[] indexParameterTypes =
+                property.GetIndexParameters().Select((p) => p.ParameterType).ToArray();
+
+            Type? baseType = member.DeclaringType.BaseType;
+            while (baseType != null)
+            {
+                PropertyInfo? baseProperty = baseType.GetProperty(
+                    property.Name,
+                    bindingFlags,
+                    binder: null,
+                    property.PropertyType,
+                    indexParameterTypes,
+                    modifiers: null);
+                if (baseProperty != null)
+                {
+                    return baseProperty;
+                }
+
+                baseType = baseType.BaseType;
+            }
+
+            foreach (Type interfaceType in member.DeclaringType.GetInterfaces())
+            {
+                PropertyInfo? interfaceProperty = interfaceType.GetProperty(
+                    property.Name,
+                    bindingFlags,
+                    binder: null,
+                    property.PropertyType,
+                    indexParameterTypes,
+                    modifiers: null);
+                if (interfaceProperty != null)
+                {
+                    return interfaceProperty;
+                }
+            }
+        }
+        else if (member is MethodInfo method)
+        {
+            Type[] parameterTypes = method.GetParameters().Select((p) => p.ParameterType).ToArray();
+
+            Type? baseType = member.DeclaringType.BaseType;
+            while (baseType != null)
+            {
+                MethodInfo? baseMethod = baseType.GetMethod(
+                    method.Name,
+                    bindingFlags,
+                    binder: null,
+                    parameterTypes,
+                    modifiers: null);
+                if (baseMethod != null)
+                {
+                    return baseMethod;
+                }
+
+                baseType = baseType.BaseType;
+            }
+
+            foreach (Type interfaceType in member.DeclaringType.GetInterfaces())
+            {
+                MethodInfo? interfaceMethod = interfaceType.GetMethod(
+                    method.Name,
+                    bindingFlags,
+                    binder: null,
+                    parameterTypes,
+                    modifiers: null);
+                if (interfaceMethod != null)
+                {
+                    return interfaceMethod;
+                }
+            }
+        }
+
+        return null;
     }
 
     private static string FormatDocText(XNode? node)
@@ -1975,8 +2243,12 @@ import { Duplex } from 'stream';
         Type[]? genericTypeParams,
         Type[]? genericMethodParams)
     {
-#if NETFRAMEWORK
-        if (type.IsGenericMethodParameter() && genericMethodParams != null)
+#if NETFRAMEWORK || NETSTANDARD
+        if (type.IsGenericTypeParameter() && genericTypeParams != null)
+        {
+            return "`" + Array.IndexOf(genericTypeParams, type);
+        }
+        else if (type.IsGenericMethodParameter() && genericMethodParams != null)
 #else
         if (type.IsGenericTypeParameter && genericTypeParams != null)
         {
