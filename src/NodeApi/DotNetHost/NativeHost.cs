@@ -43,12 +43,154 @@ internal unsafe partial class NativeHost : IDisposable
         }
     }
 
+    private static bool s_moduleUnloadPrevented;
+
+    /// <summary>
+    /// Pins this native host module in memory so the OS never unloads it.
+    /// </summary>
+    /// <remarks>
+    /// This native host is compiled with NativeAOT, so it embeds a .NET runtime whose
+    /// per-thread cleanup is registered with the OS via a <c>pthread_key</c> destructor that
+    /// points into this module's own code. Node.js unloads (<c>dlclose</c>) an addon when the
+    /// environment that loaded it is torn down. When a <c>worker_threads</c> Worker loads this
+    /// module and is then terminated, Node unloads the module while the worker's OS thread is
+    /// still alive; the still-registered destructor then points at unmapped memory and the
+    /// process crashes with SIGSEGV as the thread exits (glibc <c>__nptl_deallocate_tsd</c>).
+    /// Keeping the module mapped for the lifetime of the process keeps that destructor valid.
+    /// <para/>
+    /// This is scoped to Linux (glibc) and macOS, where the native host can be unloaded before
+    /// the worker thread exits; on Windows module/thread teardown does not hit this issue. The
+    /// pin is best-effort: any failure is traced but does not block init.
+    /// </remarks>
+    private static unsafe void PreventModuleUnload()
+    {
+        if (s_moduleUnloadPrevented)
+        {
+            return;
+        }
+
+        s_moduleUnloadPrevented = true;
+
+        bool isMacOS = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && !isMacOS)
+        {
+            return;
+        }
+
+        try
+        {
+            // Resolve the file path of this shared library from the address of one of its
+            // own functions, then re-open it with RTLD_NODELETE so it is never unmapped.
+            nint moduleFunction =
+                (nint)(delegate* unmanaged[Cdecl]<napi_env, napi_value, napi_value>)
+                &InitializeModule;
+
+            nint fileName = default;
+            if (DlAddr(moduleFunction, out Dl_info info) != 0)
+            {
+                fileName = info.dli_fname;
+            }
+
+            if (fileName != default)
+            {
+                // RTLD_NOLOAD resolves the already-loaded module without loading a new copy;
+                // RTLD_NODELETE keeps it mapped for the process lifetime. The extra (never
+                // released) reference also prevents Node's dlclose from unmapping it.
+                const int RTLD_LAZY = 0x0001;
+                const int RTLD_NOLOAD_LINUX = 0x0004;
+                const int RTLD_NODELETE_LINUX = 0x1000;
+                const int RTLD_NOLOAD_MACOS = 0x0010;
+                const int RTLD_NODELETE_MACOS = 0x0080;
+                int flags = RTLD_LAZY | (isMacOS ?
+                    RTLD_NOLOAD_MACOS | RTLD_NODELETE_MACOS :
+                    RTLD_NOLOAD_LINUX | RTLD_NODELETE_LINUX);
+                nint handle = DlOpen(fileName, flags);
+                Trace($"    Pinned native host module ({(handle != default ? "ok" : "no-op")}).");
+            }
+            else
+            {
+                Trace("    Could not resolve native host module path to pin it.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Trace("    Failed to pin native host module: " + ex);
+        }
+    }
+
+    // dladdr and dlopen are exported by libSystem on macOS. On Linux they are exported by
+    // libc.so.6 on glibc >= 2.34, but by libdl.so.2 on older glibc versions.
+    private static int DlAddr(nint addr, out Dl_info info)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return DlAddrLibSystem(addr, out info);
+        }
+
+        try
+        {
+            return DlAddrLibc(addr, out info);
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException)
+        {
+            return DlAddrLibdl(addr, out info);
+        }
+    }
+
+    private static nint DlOpen(nint fileName, int flags)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return DlOpenLibSystem(fileName, flags);
+        }
+
+        try
+        {
+            return DlOpenLibc(fileName, flags);
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException)
+        {
+            return DlOpenLibdl(fileName, flags);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Dl_info
+    {
+        public nint dli_fname;
+        public nint dli_fbase;
+        public nint dli_sname;
+        public nint dli_saddr;
+    }
+
+    [LibraryImport("libc.so.6", EntryPoint = "dladdr")]
+    private static partial int DlAddrLibc(nint addr, out Dl_info info);
+
+    [LibraryImport("libdl.so.2", EntryPoint = "dladdr")]
+    private static partial int DlAddrLibdl(nint addr, out Dl_info info);
+
+    [LibraryImport("libc.so.6", EntryPoint = "dlopen")]
+    private static partial nint DlOpenLibc(nint filename, int flags);
+
+    [LibraryImport("libdl.so.2", EntryPoint = "dlopen")]
+    private static partial nint DlOpenLibdl(nint filename, int flags);
+
+    [LibraryImport("/usr/lib/libSystem.B.dylib", EntryPoint = "dladdr")]
+    private static partial int DlAddrLibSystem(nint addr, out Dl_info info);
+
+    [LibraryImport("/usr/lib/libSystem.B.dylib", EntryPoint = "dlopen")]
+    private static partial nint DlOpenLibSystem(nint filename, int flags);
+
     [UnmanagedCallersOnly(
         EntryPoint = nameof(napi_register_module_v1),
         CallConvs = new[] { typeof(CallConvCdecl) })]
     public static napi_value InitializeModule(napi_env env, napi_value exports)
     {
         Trace($"> NativeHost.InitializeModule({env.Handle:X8}, {exports.Handle:X8})");
+
+        // Ensure this native module stays loaded for the lifetime of the process. See
+        // PreventModuleUnload() for details on the worker-thread teardown crash this avoids.
+        PreventModuleUnload();
 
         s_jsRuntime ??= new NodejsRuntime();
 
