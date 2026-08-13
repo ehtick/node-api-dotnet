@@ -346,12 +346,17 @@ public class JSReference : IDisposable
 
     protected virtual void Dispose(bool disposing)
     {
-        if (!IsDisposed)
+        if (IsDisposed)
         {
-            IsDisposed = true;
+            return;
+        }
 
-            // The context may be null if the reference was created from a "no-context" scope such
-            // as the native host. In that case the reference must be disposed from the JS thread.
+        IsDisposed = true;
+
+        if (disposing)
+        {
+            // Explicit disposal preserves the documented behavior, including asserting that a
+            // no-context reference is disposed from the JS thread.
             if (_context == null)
             {
                 ThrowIfInvalidThreadAccess();
@@ -364,7 +369,74 @@ public class JSReference : IDisposable
                         _env, _handle).ThrowIfFailed(), allowSync: true);
             }
         }
+        else
+        {
+            // The finalizer runs on the GC finalizer thread and MUST NOT throw: an exception
+            // escaping a finalizer terminates the process (observed as a fatal
+            // JSInvalidThreadAccessException / SIGSEGV during worker-thread teardown). Release the
+            // native reference only if it can be done without switching threads or asserting an
+            // active JS scope, and never let an exception propagate.
+            DisposeFromFinalizer();
+        }
     }
 
-    ~JSReference() => Dispose(disposing: false);
+    private void DisposeFromFinalizer()
+    {
+        try
+        {
+            if (_context == null)
+            {
+                // A no-context reference (for example one created from the native host scope) can
+                // only be deleted on the JS thread. CurrentOrNull is thread-static, so on the real
+                // GC finalizer thread it is null and this delete is skipped; the napi_ref is then
+                // reclaimed when the JS environment is destroyed. The guarded delete still runs if
+                // Dispose(disposing: false) is ever invoked on the owning JS thread. A no-context
+                // scope has no synchronization context, so the finalizer cannot marshal the delete
+                // to the JS thread; doing so would require an env-scoped cleanup queue in the
+                // native host (tracked as a follow-up).
+                JSValueScope? scope = JSValueScope.CurrentOrNull;
+                if (scope != null && scope.UncheckedEnvironmentHandle == _env)
+                {
+                    scope.Runtime.DeleteReference(_env, _handle);
+                }
+            }
+            else
+            {
+                // Post the delete to the JS thread. The synchronization context is a safe no-op
+                // once it has been disposed (that is, after the worker has been torn down).
+                _context.SynchronizationContext?.Post(
+                    () =>
+                    {
+                        try
+                        {
+                            _context.Runtime.DeleteReference(_env, _handle);
+                        }
+                        catch
+                        {
+                            // The environment may already be gone; nothing more can be done.
+                        }
+                    },
+                    allowSync: false);
+            }
+        }
+        catch
+        {
+            // Never allow an exception to escape the finalizer.
+        }
+    }
+
+    ~JSReference()
+    {
+        // An exception escaping a finalizer terminates the process. Dispose(bool) is virtual, so a
+        // derived override may throw before or after the base implementation runs; catch here at
+        // the finalizer entry point so the no-throw guarantee also covers overrides.
+        try
+        {
+            Dispose(disposing: false);
+        }
+        catch
+        {
+            // Never allow an exception to escape the finalizer.
+        }
+    }
 }

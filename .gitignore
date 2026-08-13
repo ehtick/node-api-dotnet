@@ -18,3 +18,6 @@ examples/**/package-lock.json
 
 cache/
 dist/
+
+# Generated at test time by TestBuilder.WriteCurrentFrameworkGlobalJson (per-runtime SDK pin)
+test/TestCases/**/global.json

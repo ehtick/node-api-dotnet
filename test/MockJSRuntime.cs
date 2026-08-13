@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using Microsoft.JavaScript.NodeApi.Interop;
 using Microsoft.JavaScript.NodeApi.Runtime;
 using Xunit;
@@ -188,6 +189,12 @@ internal class MockJSRuntime : JSRuntime
     }
 
     /// <summary>
+    /// Reports whether a reference handle is still present (that is, has not been deleted by
+    /// <see cref="DeleteReference"/>). Lets a test assert that a deferred delete actually ran.
+    /// </summary>
+    public bool HasReference(napi_ref @ref) => _references.ContainsKey(@ref.Handle);
+
+    /// <summary>
     /// Simulates the behavior of the JS runtime when a weakly-referenced value is released.
     /// </summary>
     public void MockReleaseWeakReferenceValue(napi_ref @ref)
@@ -205,5 +212,44 @@ internal class MockJSRuntime : JSRuntime
     {
         public override void CloseAsyncScope() => throw new NotImplementedException();
         public override void OpenAsyncScope() => throw new NotImplementedException();
+    }
+
+    // A synchronization context that records posted callbacks instead of running them, so a test
+    // can deterministically pump the queue with <see cref="RunPendingCallbacks"/> and assert that
+    // the posted work (for example a deferred DeleteReference) actually executed.
+    public class RecordingSynchronizationContext : JSSynchronizationContext
+    {
+        private readonly Queue<(SendOrPostCallback Callback, object? State)> _posted = new();
+
+        public int PendingCount => _posted.Count;
+
+        public override void Post(SendOrPostCallback callback, object? state)
+        {
+            if (IsDisposed) return;
+            _posted.Enqueue((callback, state));
+        }
+
+        public override void Send(SendOrPostCallback callback, object? state)
+        {
+            if (IsDisposed) return;
+            callback(state);
+        }
+
+        // Runs every callback posted so far and returns how many were run.
+        public int RunPendingCallbacks()
+        {
+            int count = 0;
+            while (_posted.Count > 0)
+            {
+                (SendOrPostCallback callback, object? state) = _posted.Dequeue();
+                callback(state);
+                count++;
+            }
+
+            return count;
+        }
+
+        public override void CloseAsyncScope() { }
+        public override void OpenAsyncScope() { }
     }
 }

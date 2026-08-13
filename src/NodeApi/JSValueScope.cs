@@ -77,8 +77,6 @@ public sealed class JSValueScope : IDisposable
     private readonly SynchronizationContext? _previousSyncContext;
     private readonly nint _scopeHandle;
 
-    [ThreadStatic] private static JSValueScope? s_currentScope;
-
     public JSValueScopeType ScopeType { get; }
 
     /// <summary>
@@ -86,8 +84,16 @@ public sealed class JSValueScope : IDisposable
     /// </summary>
     /// <exception cref="JSInvalidThreadAccessException">No scope was established for the current
     /// thread.</exception>
-    public static JSValueScope Current => s_currentScope ??
+    public static JSValueScope Current => CurrentOrNull ??
         throw new JSInvalidThreadAccessException(currentScope: null);
+
+    /// <summary>
+    /// Gets the current JS value scope for the calling thread, or null if no scope is
+    /// established. Unlike <see cref="Current"/>, this never throws, so it is safe to use from
+    /// contexts that must not throw, such as finalizers.
+    /// </summary>
+    [field: ThreadStatic]
+    internal static JSValueScope? CurrentOrNull { get; private set; }
 
     /// <summary>
     /// Gets the environment handle for the scope, or throws an exception if the scope is
@@ -139,7 +145,7 @@ public sealed class JSValueScope : IDisposable
     internal nint RuntimeContextHandle { get; }
 
     internal static JSRuntime CurrentRuntime => Current.Runtime;
-    internal static JSRuntimeContext? CurrentRuntimeContext => s_currentScope?.RuntimeContext;
+    internal static JSRuntimeContext? CurrentRuntimeContext => CurrentOrNull?.RuntimeContext;
 
     public JSModuleContext? ModuleContext { get; internal set; }
 
@@ -175,7 +181,7 @@ public sealed class JSValueScope : IDisposable
         if (scopeType == JSValueScopeType.NoContext)
         {
             // A NoContext scope can inherit the env from a parent NoContext scope.
-            _parentScope = s_currentScope;
+            _parentScope = CurrentOrNull;
             if (_parentScope != null && _parentScope.ScopeType != JSValueScopeType.NoContext)
             {
                 throw new InvalidOperationException(
@@ -197,7 +203,7 @@ public sealed class JSValueScope : IDisposable
         }
         else if (scopeType == JSValueScopeType.Root)
         {
-            _parentScope = s_currentScope;
+            _parentScope = CurrentOrNull;
             if (_parentScope != null)
             {
                 if (_parentScope.ScopeType == JSValueScopeType.Root)
@@ -230,7 +236,7 @@ public sealed class JSValueScope : IDisposable
         }
         else
         {
-            _parentScope = s_currentScope;
+            _parentScope = CurrentOrNull;
 
             if (scopeType == JSValueScopeType.Module &&
                 _parentScope != null && _parentScope.ScopeType == JSValueScopeType.Module)
@@ -317,10 +323,10 @@ public sealed class JSValueScope : IDisposable
             _ => default,
         };
 
-        JSValueScope? previousScope = s_currentScope;
+        JSValueScope? previousScope = CurrentOrNull;
         try
         {
-            s_currentScope = this;
+            CurrentOrNull = this;
 
             if (scopeType == JSValueScopeType.NoContext)
             {
@@ -350,7 +356,7 @@ public sealed class JSValueScope : IDisposable
         }
         catch (Exception)
         {
-            s_currentScope = previousScope;
+            CurrentOrNull = previousScope;
             throw;
         }
     }
@@ -380,7 +386,7 @@ public sealed class JSValueScope : IDisposable
             }
         }
 
-        s_currentScope = _parentScope;
+        CurrentOrNull = _parentScope;
     }
 
     public JSValue Escape(JSValue value)
@@ -420,9 +426,9 @@ public sealed class JSValueScope : IDisposable
     /// thread.</exception>
     internal void ThrowIfInvalidThreadAccess()
     {
-        if (s_currentScope?._env != _env)
+        if (CurrentOrNull?._env != _env)
         {
-            throw new JSInvalidThreadAccessException(currentScope: s_currentScope, targetScope: this);
+            throw new JSInvalidThreadAccessException(currentScope: CurrentOrNull, targetScope: this);
         }
     }
 }
