@@ -2,9 +2,11 @@
 // Licensed under the MIT License.
 
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Threading;
 using Microsoft.JavaScript.NodeApi.Interop;
+using Microsoft.JavaScript.NodeApi.Runtime;
 using static Microsoft.JavaScript.NodeApi.Runtime.JSRuntime;
 
 namespace Microsoft.JavaScript.NodeApi;
@@ -31,6 +33,30 @@ public class JSReference : IDisposable
     private readonly napi_ref _handle;
     private readonly napi_env _env;
     private readonly JSRuntimeContext? _context;
+
+    /// <summary>
+    /// Environment-scoped queue of no-context references whose finalizers could not release them
+    /// on the JS thread, keyed by the owning environment handle.
+    /// </summary>
+    /// <remarks>
+    /// A no-context reference has no <see cref="JSSynchronizationContext"/>, so when its finalizer
+    /// runs on the GC finalizer thread (which has no JS scope) it cannot marshal
+    /// <c>DeleteReference</c> back to the owning JS thread. Rather than leaking the
+    /// <c>napi_ref</c> until the environment is destroyed, the finalizer enqueues the handle here.
+    /// The deletion is then performed the next time a scope for the same environment is active on
+    /// its JS thread (see <see cref="JSValueScope"/>), and a final drain runs when that
+    /// environment's root scope is disposed. Deferred handles are always drained while the
+    /// environment is still alive, so the queued <c>napi_ref</c> remains valid.
+    /// </remarks>
+    private static readonly ConcurrentDictionary<napi_env, ConcurrentQueue<napi_ref>>
+        s_pendingFinalizerDeletions = new();
+
+    /// <summary>
+    /// Total number of deferred deletions pending across all environments. Used as a cheap
+    /// fast-path gate so that the common case (nothing pending) avoids a dictionary lookup on
+    /// every scope entry.
+    /// </summary>
+    private static int s_pendingFinalizerDeletionCount;
 
     /// <summary>
     /// Creates a new instance of a <see cref="JSReference"/> that holds a strong or weak
@@ -388,16 +414,20 @@ public class JSReference : IDisposable
             {
                 // A no-context reference (for example one created from the native host scope) can
                 // only be deleted on the JS thread. CurrentOrNull is thread-static, so on the real
-                // GC finalizer thread it is null and this delete is skipped; the napi_ref is then
-                // reclaimed when the JS environment is destroyed. The guarded delete still runs if
-                // Dispose(disposing: false) is ever invoked on the owning JS thread. A no-context
-                // scope has no synchronization context, so the finalizer cannot marshal the delete
-                // to the JS thread; doing so would require an env-scoped cleanup queue in the
-                // native host (tracked as a follow-up).
+                // GC finalizer thread it is null and the inline delete below is skipped; the
+                // handle is instead deferred to be deleted the next time a scope for this
+                // environment is active on its JS thread (see JSValueScope). The guarded delete
+                // still runs directly if Dispose(disposing: false) is ever invoked on the owning
+                // JS thread. This releases the napi_ref promptly instead of leaking it until the
+                // JS environment is destroyed.
                 JSValueScope? scope = JSValueScope.CurrentOrNull;
                 if (scope != null && scope.UncheckedEnvironmentHandle == _env)
                 {
                     scope.Runtime.DeleteReference(_env, _handle);
+                }
+                else
+                {
+                    EnqueuePendingDeletion(_env, _handle);
                 }
             }
             else
@@ -422,6 +452,78 @@ public class JSReference : IDisposable
         catch
         {
             // Never allow an exception to escape the finalizer.
+        }
+    }
+
+    /// <summary>
+    /// Records a no-context reference handle whose deletion was deferred because its finalizer
+    /// could not run on the owning JS thread. The handle is deleted later by
+    /// <see cref="DrainPendingDeletions"/> or <see cref="RemovePendingDeletions"/>.
+    /// </summary>
+    private static void EnqueuePendingDeletion(napi_env env, napi_ref handle)
+    {
+        s_pendingFinalizerDeletions
+            .GetOrAdd(env, _ => new ConcurrentQueue<napi_ref>())
+            .Enqueue(handle);
+        Interlocked.Increment(ref s_pendingFinalizerDeletionCount);
+    }
+
+    /// <summary>
+    /// Deletes any no-context reference handles that were deferred by a finalizer for the given
+    /// environment. Must be called on the JS thread that owns <paramref name="env"/> with an
+    /// active scope, so that <c>DeleteReference</c> is valid.
+    /// </summary>
+    /// <param name="env">The environment whose deferred deletions should be released.</param>
+    /// <param name="runtime">The JS runtime for the environment.</param>
+    internal static void DrainPendingDeletions(napi_env env, JSRuntime runtime)
+    {
+        // Fast path: avoid a dictionary lookup on every scope entry when nothing is pending.
+        if (Volatile.Read(ref s_pendingFinalizerDeletionCount) == 0)
+        {
+            return;
+        }
+
+        if (!s_pendingFinalizerDeletions.TryGetValue(
+            env, out ConcurrentQueue<napi_ref>? queue))
+        {
+            return;
+        }
+
+        DeletePendingHandles(env, runtime, queue);
+    }
+
+    /// <summary>
+    /// Performs a final drain of deferred deletions for an environment that is being torn down and
+    /// removes its queue, so the registry does not retain entries for environments that no longer
+    /// exist. Must be called on the owning JS thread while the environment is still alive.
+    /// </summary>
+    /// <param name="env">The environment being torn down.</param>
+    /// <param name="runtime">The JS runtime for the environment.</param>
+    internal static void RemovePendingDeletions(napi_env env, JSRuntime runtime)
+    {
+        if (!s_pendingFinalizerDeletions.TryRemove(
+            env, out ConcurrentQueue<napi_ref>? queue))
+        {
+            return;
+        }
+
+        DeletePendingHandles(env, runtime, queue);
+    }
+
+    private static void DeletePendingHandles(
+        napi_env env, JSRuntime runtime, ConcurrentQueue<napi_ref> queue)
+    {
+        while (queue.TryDequeue(out napi_ref handle))
+        {
+            Interlocked.Decrement(ref s_pendingFinalizerDeletionCount);
+            try
+            {
+                runtime.DeleteReference(env, handle);
+            }
+            catch
+            {
+                // Best effort: the environment may already be gone.
+            }
         }
     }
 

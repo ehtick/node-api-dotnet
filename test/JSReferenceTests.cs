@@ -133,7 +133,66 @@ public class JSReferenceTests
         Assert.True(reference.IsDisposed);
     }
 
-    // A reference with a runtime context posts its cleanup to the JS thread instead of deleting it
+    // A no-context reference finalized off the JS thread cannot be deleted inline (there is no
+    // synchronization context to marshal the delete back to the JS thread). Instead of leaking the
+    // napi_ref until the environment is destroyed, the finalizer defers the deletion, which is then
+    // performed the next time a scope for the same environment is active on its JS thread.
+    [Fact]
+    public void FinalizeNoContextReferenceDefersDeletionUntilNextScope()
+    {
+        napi_env env = new(Environment.CurrentManagedThreadId);
+        using JSValueScope noContextScope = new(
+            JSValueScopeType.NoContext, env, _mockRuntime,
+            new MockJSRuntime.SynchronizationContext());
+
+        JSValue value = JSValue.CreateObject();
+        var reference = new FinalizerTestReference(value);
+        napi_ref handle = reference.Handle;
+        Assert.True(_mockRuntime.HasReference(handle));
+
+        // Simulate the GC finalizer thread: no current scope, so the delete cannot run inline.
+        TestUtils.RunInThread(() => reference.SimulateFinalize()).Wait();
+        Assert.True(reference.IsDisposed);
+
+        // The delete is deferred, not run on the finalizer thread, so the reference still exists.
+        Assert.True(_mockRuntime.HasReference(handle));
+
+        // Entering a scope for the same environment on the JS thread drains the deferred deletion.
+        using (JSValueScope drainScope = new(JSValueScopeType.NoContext))
+        {
+        }
+
+        Assert.False(_mockRuntime.HasReference(handle));
+    }
+
+    // When the environment-scoped scope that owns a deferred no-context deletion is disposed, a
+    // final drain runs so the napi_ref is released even if no further scope is entered.
+    [Fact]
+    public void DisposingScopeDrainsDeferredNoContextDeletion()
+    {
+        napi_env env = new(Environment.CurrentManagedThreadId);
+        napi_ref handle;
+
+        var noContextScope = new JSValueScope(
+            JSValueScopeType.NoContext, env, _mockRuntime,
+            new MockJSRuntime.SynchronizationContext());
+        try
+        {
+            JSValue value = JSValue.CreateObject();
+            var reference = new FinalizerTestReference(value);
+            handle = reference.Handle;
+
+            TestUtils.RunInThread(() => reference.SimulateFinalize()).Wait();
+            Assert.True(_mockRuntime.HasReference(handle));
+        }
+        finally
+        {
+            // Disposing the environment-scoped scope performs the final drain.
+            noContextScope.Dispose();
+        }
+
+        Assert.False(_mockRuntime.HasReference(handle));
+    }
     // inline. The finalizer must never throw when it runs on a thread with no current scope, and
     // the posted delete must actually release the native reference once the JS thread pumps it.
     [Fact]

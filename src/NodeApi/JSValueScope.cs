@@ -359,12 +359,27 @@ public sealed class JSValueScope : IDisposable
             CurrentOrNull = previousScope;
             throw;
         }
+
+        // Release any no-context reference deletions that a finalizer had to defer because it could
+        // not run on the JS thread. This scope is active on the owning JS thread, so deleting the
+        // deferred handles here is valid. The call is a cheap no-op when nothing is pending.
+        JSReference.DrainPendingDeletions(_env, Runtime);
     }
 
     public void Dispose()
     {
         if (IsDisposed) return;
         IsDisposed = true;
+
+        if (ScopeType == JSValueScopeType.Root || ScopeType == JSValueScopeType.NoContext)
+        {
+            // This environment-scoped scope is going away, so perform a final drain of any deferred
+            // no-context reference deletions and remove the environment's queue, preventing the
+            // registry from retaining entries for environments that no longer exist. The scope is
+            // still current here, so deletion runs on the owning JS thread while the environment is
+            // alive.
+            JSReference.RemovePendingDeletions(_env, Runtime);
+        }
 
         if (ScopeType != JSValueScopeType.NoContext)
         {

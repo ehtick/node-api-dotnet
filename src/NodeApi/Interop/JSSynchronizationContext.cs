@@ -254,6 +254,10 @@ internal sealed unsafe class JSTsfnSynchronizationContext : JSSynchronizationCon
     private readonly JSRuntime _runtime;
     private readonly napi_env _env;
     private readonly JSThreadSafeFunction _tsfn;
+
+    // Coordinates in-flight NonBlockingCall invocations with TSFN release during teardown, so that
+    // a poster can never call into the TSFN after (or while) it is being released.
+    private readonly TsfnCallGate _callGate = new();
     private GCHandle _cleanupHandle;
 
     public JSTsfnSynchronizationContext()
@@ -297,6 +301,11 @@ internal sealed unsafe class JSTsfnSynchronizationContext : JSSynchronizationCon
         }
 
         base.Dispose();
+
+        // Prevent any new NonBlockingCall from starting and wait for in-flight calls to finish
+        // before releasing the TSFN. This closes the post-then-release race in which a poster could
+        // call into the TSFN after the environment cleanup hook has released it.
+        _callGate.Close();
 
         // Destroy TSFN by releasing last thread use count.
         // TSFN is deleted after this point and must not be used.
@@ -348,9 +357,16 @@ internal sealed unsafe class JSTsfnSynchronizationContext : JSSynchronizationCon
 
     public override void Post(SendOrPostCallback callback, object? state)
     {
-        if (IsDisposed) return;
+        if (!_callGate.TryEnter()) return;
 
-        _tsfn.NonBlockingCall(() => callback(state));
+        try
+        {
+            _tsfn.NonBlockingCall(() => callback(state));
+        }
+        finally
+        {
+            _callGate.Exit();
+        }
     }
 
     public override void Send(SendOrPostCallback callback, object? state)
@@ -361,14 +377,25 @@ internal sealed unsafe class JSTsfnSynchronizationContext : JSSynchronizationCon
             return;
         }
 
-        if (IsDisposed) return;
-
         using ManualResetEvent syncEvent = new(false);
-        _tsfn.NonBlockingCall(() =>
+
+        // The gate is held only around the native NonBlockingCall, not around the wait below: the
+        // posted callback runs on the JS thread and could otherwise deadlock TSFN release.
+        if (!_callGate.TryEnter()) return;
+
+        try
         {
-            callback(state);
-            syncEvent.Set();
-        });
+            _tsfn.NonBlockingCall(() =>
+            {
+                callback(state);
+                syncEvent.Set();
+            });
+        }
+        finally
+        {
+            _callGate.Exit();
+        }
+
         syncEvent.WaitOne();
     }
 }
